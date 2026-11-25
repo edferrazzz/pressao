@@ -1,0 +1,64 @@
+name: Build
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows:
+    name: Windows (VST3 + instalador)
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -S . -B build -A x64
+      - name: Build
+        run: cmake --build build --config Release --parallel --target Pressao_VST3 pressao_tests
+      - name: Test
+        run: ctest --test-dir build -C Release --output-on-failure
+      - name: Collect
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item -Recurse "build/Pressao_artefacts/Release/VST3/Pressao.vst3" "dist/Pressao.vst3"
+          Get-ChildItem -Recurse dist -Include *.pdb,*.lib,*.exp | Remove-Item
+      - name: Installer
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (!(Test-Path $iscc)) { choco install innosetup -y --no-progress; }
+          $v = (Select-String -Path CMakeLists.txt -Pattern 'project\(Pressao VERSION ([0-9.]+)').Matches[0].Groups[1].Value
+          & $iscc "/DAppVersion=$v" installer/Pressao.iss
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Publish installer to the repo
+        if: github.event_name != 'pull_request'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force Release/Windows | Out-Null
+          Copy-Item "dist/Pressao * Instalador.exe" Release/Windows/
+          $v = (Select-String -Path CMakeLists.txt -Pattern 'project\(Pressao VERSION ([0-9.]+)').Matches[0].Groups[1].Value
+          Compress-Archive -Force -Path dist/Pressao.vst3 -DestinationPath "Release/Windows/Pressao $v VST3 Windows.zip"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Release/Windows
+          git diff --cached --quiet
+          if ($LASTEXITCODE) {
+            git commit -m "Windows installer from CI (MSVC) [skip ci]"
+            for ($i = 0; $i -lt 5; $i++) { git pull --rebase origin main; git push origin HEAD:main; if (!$LASTEXITCODE) { break }; Start-Sleep 10 }
+          }
+          exit 0
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pressao-windows-${{ github.sha }}
+          path: dist/
+          retention-days: 14
