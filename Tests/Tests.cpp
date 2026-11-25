@@ -83,11 +83,11 @@ void testPresets() {
                 }
             const auto tag = name + " @" + juce::String((int) (k * 100));
             expect(finite, tag + " finite");
-            expect(peak <= 1.0f, tag + " peak " + juce::String(peak));
+            expect(peak <= 0.967f, tag + " limiter holds -0.3 dBFS (peak " + juce::String(peak) + ")");
             const double outRms = rms(b, (int) sr);
             const double db = juce::Decibels::gainToDecibels(outRms / inRms);
             if (k == 0.0f) expect(std::abs(db) < 1.0, tag + " transparent at 0 (" + juce::String(db, 2) + " dB)");
-            else expect(db > -9.0 && db < 6.0, tag + " loudness in range (" + juce::String(db, 2) + " dB)");
+            else expect(db > -12.0 && db < 0.6, tag + " never louder than the original (" + juce::String(db, 2) + " dB)");
             if (k == 1.0f) {
                 // must clearly change the sound
                 double num = 0.0, da = 0.0, db2 = 0.0;
@@ -157,6 +157,29 @@ void testPresets() {
         }
         for (int ch = 0; ch < 2; ++ch) for (int i = 0; i < b.getNumSamples(); ++i) { finite = finite && std::isfinite(b.getSample(ch, i)); peak = juce::jmax(peak, std::abs(b.getSample(ch, i))); }
         expect(finite && peak <= 1.0f, "MEU PRESET with everything at max is clean (peak " + juce::String(peak) + ")");
+    }
+    // the low end never goes into the reverb: a 60 Hz burst leaves no tail
+    {
+        Custom c; c.highpass = 0.0f; c.reverb = 1.0f; c.reverbType = 2;
+        const auto pr = toPreset(c);
+        Engine e; e.prepare(sr, block);
+        juce::AudioBuffer<float> b(2, (int) (3.0 * sr));
+        b.clear();
+        for (int i = 0; i < (int) sr; ++i)
+            for (int ch = 0; ch < 2; ++ch) {
+                const float fade = (float) juce::jmin(1.0, juce::jmin(i, (int) sr - i) / (0.05 * sr));   // no clicks
+                b.setSample(ch, i, 0.6f * fade * (float) std::sin(2.0 * juce::MathConstants<double>::pi * 60.0 * i / sr));
+            }
+        HostTime time;
+        for (int start = 0; start < b.getNumSamples(); start += block) {
+            const int n = juce::jmin(block, b.getNumSamples() - start);
+            juce::AudioBuffer<float> view(b.getArrayOfWritePointers(), 2, start, n);
+            e.process(view, 1.0f, pr, customSlot, time);
+        }
+        juce::AudioBuffer<float> tail(2, (int) sr);
+        for (int ch = 0; ch < 2; ++ch) tail.copyFrom(ch, 0, b, ch, (int) (1.3 * sr), (int) sr);
+        const double tailDb = juce::Decibels::gainToDecibels(rms(tail) / 0.42);
+        expect(tailDb < -45.0, "no reverb tail from the low end (" + juce::String(tailDb, 1) + " dB)");
     }
     // silence in, silence out
     {

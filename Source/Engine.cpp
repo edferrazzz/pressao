@@ -16,12 +16,6 @@ float ramp(const Ramp& r, float p) {
     return r.amount * smoothstep((p - r.from) / span);
 }
 
-float softCeiling(float x) {
-    const float a = std::abs(x);
-    if (a <= 0.89f) return x;
-    const float over = (a - 0.89f) / 0.11f;
-    return std::copysign(0.89f + 0.11f * std::tanh(over), x);
-}
 } // namespace
 
 Levels levelsFor(const Preset& pr, float p) {
@@ -57,7 +51,10 @@ void Engine::prepare(double sampleRate, int block) {
     sr = sampleRate;
     maxBlock = juce::jmax(32, block);
     os.initProcessing((size_t) maxBlock);
-    latency = (int) std::lround(os.getLatencyInSamples());
+    lookahead = juce::jmax(8, (int) std::lround(sr * 0.0015));
+    latency = (int) std::lround(os.getLatencyInSamples()) + lookahead;
+    for (auto& d : limDelay) d.assign((size_t) lookahead + 1, 0.0f);
+    limPeaks.assign((size_t) lookahead + 1, 0.0f);
     juce::dsp::ProcessSpec spec { sr, (juce::uint32) maxBlock, 1 };
     for (int c = 0; c < 2; ++c) {
         lp[c].prepare(spec); lp[c].setType(juce::dsp::StateVariableTPTFilterType::lowpass);
@@ -67,7 +64,15 @@ void Engine::prepare(double sampleRate, int block) {
     reverb.prepare({ sr, (juce::uint32) maxBlock, 2 });
     for (auto& b : delayBuf) b.assign((size_t) (sr * 2.5), 0.0f);
     noiseBp.prepare(spec); noiseBp.setType(juce::dsp::StateVariableTPTFilterType::bandpass); noiseBp.setResonance(1.2f);
-    for (auto& f : reverbHp) { f.prepare(spec); f.setType(juce::dsp::StateVariableTPTFilterType::highpass); f.setCutoffFrequency(250.0f); }
+    // what goes into the reverb and the delay: nothing below the cut (no muddy low end), no harsh top
+    for (int c = 0; c < 2; ++c) {
+        for (auto* f : { &sendHpA[c], &sendHpB[c], &delayHp[c] }) {
+            f->prepare(spec); f->setType(juce::dsp::StateVariableTPTFilterType::highpass);
+            f->setCutoffFrequency(sendCutHz); f->setResonance(0.707f);
+        }
+        sendLp[c].prepare(spec); sendLp[c].setType(juce::dsp::StateVariableTPTFilterType::lowpass);
+        sendLp[c].setCutoffFrequency(juce::jmin(11000.0f, (float) sr * 0.45f)); sendLp[c].setResonance(0.707f);
+    }
     dry.setSize(2, maxBlock);
     wet.setSize(2, maxBlock);
     knob.reset(sr, 0.05);
@@ -83,7 +88,10 @@ void Engine::reset() {
     for (auto& b : delayBuf) std::fill(b.begin(), b.end(), 0.0f);
     delayPos = 0;
     noiseBp.reset(); inputEnv = 0.0f; peakKnob = 0.0f;
-    for (auto& f : reverbHp) f.reset();
+    for (int c = 0; c < 2; ++c) { sendHpA[c].reset(); sendHpB[c].reset(); delayHp[c].reset(); sendLp[c].reset(); }
+    for (auto& d : limDelay) std::fill(d.begin(), d.end(), 0.0f);
+    std::fill(limPeaks.begin(), limPeaks.end(), 0.0f);
+    limPos = 0; limGain = 1.0f;
     gatePhase = 0.0; gateGain = 1.0f;
     dryMs = wetMs = 0.0; outGain = 1.0f;
 }
@@ -233,7 +241,8 @@ void Engine::process(juce::AudioBuffer<float>& buffer, float amount, const Prese
             int rp = delayPos - dt; if (rp < 0) rp += len;
             const float l0 = delayBuf[0][(size_t) rp], r0 = delayBuf[1][(size_t) rp];
             const float inL = buffer.getSample(0, i), inR = buffer.getSample(ch > 1 ? 1 : 0, i);
-            delayBuf[0][(size_t) delayPos] = 0.5f * (inL + inR) * 0.7f + r0 * fb;   // ping-pong
+            const float send = delayHp[1].processSample(0, delayHp[0].processSample(0, 0.5f * (inL + inR)));
+            delayBuf[0][(size_t) delayPos] = send * 0.7f + r0 * fb;   // ping-pong
             delayBuf[1][(size_t) delayPos] = l0 * fb;
             buffer.setSample(0, i, inL + mix * l0);
             if (ch > 1) buffer.setSample(1, i, inR + mix * r0);
@@ -255,7 +264,7 @@ void Engine::process(juce::AudioBuffer<float>& buffer, float amount, const Prese
         for (int c = 0; c < ch; ++c) wet.copyFrom(c, 0, buffer, c, 0, n);
         for (int c = 0; c < ch; ++c) {
             float* w = wet.getWritePointer(c);
-            for (int i = 0; i < n; ++i) w[i] = reverbHp[c].processSample(0, w[i]);
+            for (int i = 0; i < n; ++i) w[i] = sendLp[c].processSample(0, sendHpB[c].processSample(0, sendHpA[c].processSample(0, w[i])));
         }
         juce::dsp::AudioBlock<float> b(wet.getArrayOfWritePointers(), (size_t) ch, (size_t) n);
         juce::dsp::ProcessContextReplacing<float> ctx(b);
@@ -282,19 +291,38 @@ void Engine::process(juce::AudioBuffer<float>& buffer, float amount, const Prese
     wetMs += k * (w / cnt - wetMs);
     float target = outGain;
     if (dryMs > 1.0e-9 && wetMs > 1.0e-12) {
-        // only part of the way: a riser is allowed to thin out, just not to vanish or blow up
+        // Never louder than the original. When the riser thins the sound out (high pass), give back
+        // only part of it: a riser is allowed to get thinner, not to vanish.
         const float matchDb = juce::Decibels::gainToDecibels((float) std::sqrt(dryMs / wetMs));
-        target = juce::Decibels::decibelsToGain(juce::jlimit(-12.0f, 9.0f, matchDb * 0.7f));
+        target = juce::Decibels::decibelsToGain(juce::jlimit(-18.0f, 8.0f, matchDb > 0.0f ? matchDb * 0.7f : matchDb));
     }
-    // a little louder as the pressure builds
-    target *= juce::Decibels::decibelsToGain(2.0f * p);
     for (int c = 0; c < ch; ++c) buffer.applyGainRamp(c, 0, n, outGain, target);
     outGain = target;
 
+    // ---- limiter: look-ahead peak limiter, ceiling -0.3 dBFS ----
     float peak = 0.0f;
-    for (int c = 0; c < ch; ++c) {
-        float* b = buffer.getWritePointer(c);
-        for (int i = 0; i < n; ++i) { b[i] = softCeiling(b[i]); peak = juce::jmax(peak, std::abs(b[i])); }
+    const int L = lookahead, len = L + 1;
+    const float limRel = (float) std::exp(-1.0 / (0.08 * sr));
+    float* bl = buffer.getWritePointer(0);
+    float* br = buffer.getWritePointer(ch > 1 ? 1 : 0);
+    for (int i = 0; i < n; ++i) {
+        const float in = juce::jmax(std::abs(bl[i]), std::abs(br[i]));
+        limPeaks[(size_t) limPos] = in > ceiling ? ceiling / in : 1.0f;   // gain this sample needs
+        limDelay[0][(size_t) limPos] = bl[i];
+        limDelay[1][(size_t) limPos] = br[i];
+        float need = 1.0f;
+        for (float g : limPeaks) need = juce::jmin(need, g);              // anything over the next L samples
+        // attack reaches the needed gain within the look-ahead window, release is smooth
+        limGain = need < limGain ? limGain + (need - limGain) * (1.0f / (float) L) * 4.0f : limRel * limGain + (1.0f - limRel) * need;
+        limGain = juce::jmin(limGain, 1.0f);
+        int rp = limPos + 1; if (rp >= len) rp = 0;
+        const float g = limGain;
+        const float ol = juce::jlimit(-ceiling, ceiling, limDelay[0][(size_t) rp] * g);
+        const float orr = juce::jlimit(-ceiling, ceiling, limDelay[1][(size_t) rp] * g);
+        bl[i] = ol;
+        if (ch > 1) br[i] = orr;
+        peak = juce::jmax(peak, std::abs(ol), std::abs(orr));
+        if (++limPos >= len) limPos = 0;
     }
     meter.store(0.8f * meter.load() + 0.2f * peak);
 }

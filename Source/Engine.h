@@ -27,6 +27,9 @@ struct Levels {
 };
 Levels levelsFor(const Preset&, float p);
 
+// Below this nothing goes into the reverb or the delay: the low end stays dry and tight.
+constexpr float sendCutHz = 320.0f;
+
 class Engine {
 public:
     Engine();
@@ -76,7 +79,13 @@ private:
     juce::dsp::StateVariableTPTFilter<float> noiseBp;
     juce::Random noiseRng { 12345 };
     float inputEnv = 0.0f;
-    juce::dsp::StateVariableTPTFilter<float> reverbHp[2];
+    juce::dsp::StateVariableTPTFilter<float> sendHpA[2], sendHpB[2], sendLp[2], delayHp[2];
+    // limiter
+    int lookahead = 72;
+    std::vector<float> limDelay[2], limPeaks;
+    int limPos = 0;
+    float limGain = 1.0f;
+    static constexpr float ceiling = 0.966f;   // -0.3 dBFS
 };
 
 } // namespace pressao
