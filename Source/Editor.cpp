@@ -1,6 +1,7 @@
 #include "Editor.h"
 #include "BinaryData.h"
 
+#include <array>
 #include <cmath>
 #include <vector>
 
@@ -43,30 +44,8 @@ struct Rng {
     float next() { s = (s * 16807) % 2147483647; return (float) s / 2147483647.0f; }
 };
 
-struct Crack { std::vector<juce::Point<float>> pts, branch; float threshold; };   // points as (angle, radius)
 struct Particle { float a, speed, phase, size, k; };
 struct Puff { float phase, speed, dx, size, k; };
-
-const std::vector<Crack>& cracks() {
-    static const std::vector<Crack> list = [] {
-        std::vector<Crack> v;
-        Rng r(7);
-        for (int i = 0; i < 14; ++i) {
-            Crack c;
-            float a = r.next() * 2.0f * pi, rad = 20.0f + r.next() * 30.0f;
-            c.pts.push_back({ a, rad });
-            while (rad < 150.0f) { rad += 10.0f + r.next() * 14.0f; a += (r.next() - 0.5f) * 0.35f; c.pts.push_back({ a, rad }); }
-            const int bi = 2 + (int) (r.next() * (float) (c.pts.size() - 3));
-            float ba = c.pts[(size_t) bi].x, br = c.pts[(size_t) bi].y;
-            c.branch.push_back({ ba, br });
-            for (int k = 0; k < 3; ++k) { br += 10.0f + r.next() * 10.0f; ba += (r.next() > 0.5f ? 1.0f : -1.0f) * (0.12f + r.next() * 0.2f); c.branch.push_back({ ba, br }); }
-            c.threshold = (float) i / 14.0f;
-            v.push_back(c);
-        }
-        return v;
-    }();
-    return list;
-}
 
 const std::vector<Particle>& embers() {
     static const std::vector<Particle> list = [] {
@@ -86,10 +65,33 @@ const std::vector<Puff>& steam() {
     return list;
 }
 
-float flameNoise(int i, double t) {
-    return 0.5f + 0.25f * (float) std::sin(t * 7.3 + i * 1.7) + 0.15f * (float) std::sin(t * 13.1 + i * 4.3)
-           + 0.1f * (float) std::sin(t * 3.1 + i * 0.7);
+// value noise + fbm: flowing flame tongues (same math as the concept page)
+const std::array<int, 512>& perm() {
+    static const std::array<int, 512> p = [] {
+        std::array<int, 512> a {};
+        for (int i = 0; i < 256; ++i) a[(size_t) i] = i;
+        Rng r(11);
+        for (int i = 255; i > 0; --i) std::swap(a[(size_t) i], a[(size_t) (int) (r.next() * (float) (i + 1)) % 256]);
+        for (int i = 0; i < 256; ++i) a[(size_t) (i + 256)] = a[(size_t) i];
+        return a;
+    }();
+    return p;
 }
+inline float hash2(int x, int y) { const auto& p = perm(); return (float) p[(size_t) ((p[(size_t) (x & 255)] + (y & 255)) & 511)] / 255.0f; }
+float vnoise(float x, float y) {
+    const float fx = std::floor(x), fy = std::floor(y);
+    const int xi = (int) fx, yi = (int) fy;
+    const float xf = x - fx, yf = y - fy;
+    const float u = xf * xf * (3.0f - 2.0f * xf), w = yf * yf * (3.0f - 2.0f * yf);
+    const float a = hash2(xi, yi), b = hash2(xi + 1, yi), c = hash2(xi, yi + 1), d = hash2(xi + 1, yi + 1);
+    return (a + (b - a) * u) + ((c + (d - c) * u) - (a + (b - a) * u)) * w;
+}
+float fbm(float x, float y) {
+    float s = 0.0f, a = 0.5f;
+    for (int o = 0; o < 4; ++o) { s += a * vnoise(x, y); x *= 2.03f; y *= 2.03f; a *= 0.5f; }
+    return s / 0.9375f;
+}
+inline float sstep(float a, float b, float x) { const float t = juce::jlimit(0.0f, 1.0f, (x - a) / (b - a)); return t * t * (3.0f - 2.0f * t); }
 
 juce::Point<float> polar(float angle, float radius) { return { std::cos(angle) * radius, std::sin(angle) * radius }; }
 
@@ -353,45 +355,47 @@ void Editor::drawGauge(juce::Graphics& g, float v, float lvl, float st, juce::Co
     // glow
     softBlob(g, 0.0f, 10.0f, 150.0f, c.withAlpha(0.15f + v * 0.3f));
 
-    // flames: a blue stove flame when low, orange/red fire when high; they dance with the audio
-    const int NF = 46;
-    const float blue = juce::jmax(0.0f, 1.0f - v * 3.0f);
-    const float react = 0.8f + 0.45f * lvl;
-    for (int i = 0; i < NF; ++i) {
-        const float a = (float) i / NF * 2.0f * pi;
-        const float bottom = juce::jmax(0.0f, std::sin(a));
-        const float n = flameNoise(i, tt * (1.0 + v));
-        const float L = (5.0f + v * 26.0f * react) * (0.55f + 0.6f * n) * (0.55f + 0.45f * bottom + 0.25f * (1.0f - bottom));
-        if (L < 4.0f) continue;
-        float dx = std::cos(a), dy = std::sin(a) - (0.5f + v * 0.6f);
-        const float dl = std::hypot(dx, dy);
-        dx /= dl; dy /= dl;
-        const auto base = polar(a, BR - 4.0f);
-        const juce::Point<float> tip(base.x + dx * L + (float) std::sin(tt * 9.0 + i) * L * 0.15f, base.y + dy * L);
-        const float w = 0.13f;
-        const auto p1 = polar(a - w, BR - 4.0f), p2 = polar(a + w, BR - 4.0f);
-        const juce::Point<float> mid((base.x + tip.x) * 0.5f + (float) std::sin(tt * 11.0 + i * 2) * L * 0.12f, (base.y + tip.y) * 0.5f);
-        juce::Path f;
-        f.startNewSubPath(p1);
-        f.quadraticTo(mid.x - dy * L * 0.25f, mid.y + dx * L * 0.25f, tip.x, tip.y);
-        f.quadraticTo(mid.x + dy * L * 0.25f, mid.y - dx * L * 0.25f, p2.x, p2.y);
-        f.closeSubPath();
-        const auto baseCol = juce::Colour::fromFloatRGBA(juce::jmap(blue, 1.0f, 0.27f), juce::jmap(blue, 0.55f, 0.47f), juce::jmap(blue, 0.16f, 1.0f), 0.9f);
-        juce::ColourGradient cg(baseCol, base.x, base.y, juce::Colour::fromFloatRGBA(1.0f, 0.24f, 0.08f, 0.0f), tip.x, tip.y, false);
-        cg.addColour(0.45, juce::Colour::fromFloatRGBA(1.0f, juce::jmap(v, 0.78f, 0.47f), 0.24f, 0.55f));
-        g.setGradientFill(cg);
-        g.fillPath(f);
+    // smoke: dark puffs rising from the flame tips at the sides, behind everything
+    for (int i = 0; i < 18; ++i) {
+        const auto& s = steam()[(size_t) i];
+        if (s.k > v * 1.2f) continue;
+        const float side = (i % 2 == 0) ? -1.0f : 1.0f;
+        const float life = (float) std::fmod(tt * (0.18 + 0.12 * s.speed) + s.phase, 1.0);
+        const float x = side * (BR + 18.0f + life * (20.0f + 30.0f * s.size / 16.0f)) + (float) std::sin(tt * 0.9 + s.phase * 20.0f) * 14.0f * life;
+        const float y = -10.0f - life * (150.0f + v * 90.0f);
+        const float r = 10.0f + life * (36.0f + s.size * 2.0f);
+        const float a = std::sin(life * pi) * (0.10f + v * 0.22f);
+        softBlob(g, x, y, r, juce::Colour::fromFloatRGBA(0.12f, 0.11f, 0.11f, a));
     }
 
-    // embers rising
+    // fire: a real flame field (noise rising), wrapping the gauge from below and licking up the sides
+    {
+        updateFire(v, lvl);
+        const float R0 = fireRadius;
+        g.setOpacity(0.55f);
+        g.drawImage(fireGlow, juce::Rectangle<float>(-R0 - 12.0f, -R0 - 12.0f, R0 * 2 + 24.0f, R0 * 2 + 24.0f));
+        g.setOpacity(1.0f);
+        g.setImageResamplingQuality(juce::Graphics::highResamplingQuality);
+        g.drawImage(fireImg, juce::Rectangle<float>(-R0, -R0, R0 * 2, R0 * 2));
+    }
+
+    // sparks: bright embers thrown up by the fire, with a short trail
     for (const auto& p : embers()) {
-        if (p.k > v * 1.05f) continue;
-        const float life = (float) std::fmod(tt * p.speed * 0.7 + p.phase, 1.0);
-        const float x = std::cos(p.a) * (BR + 10.0f) + (float) std::sin(tt * 3.0 + p.phase * 9.0f) * 8.0f;
-        const float y = std::sin(p.a) * (BR * 0.5f) + BR * 0.4f - life * (120.0f + v * 100.0f);
-        const float r = p.size * 0.8f * (1.0f - life * 0.5f);
-        g.setColour(juce::Colour::fromFloatRGBA(1.0f, (180.0f - life * 120.0f) / 255.0f, 0.24f, (1.0f - life) * 0.9f));
-        g.fillEllipse(x - r, y - r, r * 2.0f, r * 2.0f);
+        if (p.k > v * 1.1f + 0.05f) continue;
+        const float life = (float) std::fmod(tt * p.speed * (0.55 + v * 0.5) + p.phase, 1.0);
+        const float side = std::cos(p.a) >= 0.0f ? 1.0f : -1.0f;
+        const float x0 = side * (BR * (0.55f + 0.45f * std::abs(std::cos(p.a)))) ;
+        const float drift = (vnoise(p.phase * 50.0f, (float) tt * 1.5f) - 0.5f) * 60.0f * life;
+        const float x = x0 + side * life * 26.0f + drift;
+        const float y = BR * 0.35f - life * (150.0f + v * 140.0f) * p.speed;
+        const float r = p.size * 0.55f * (1.0f - life * 0.6f);
+        const float al = (1.0f - life) * (life < 0.05f ? life / 0.05f : 1.0f);
+        const auto col = juce::Colour::fromFloatRGBA(1.0f, 0.85f - life * 0.5f, 0.35f - life * 0.3f, al);
+        softBlob(g, x, y, r * 4.0f, col.withAlpha(al * 0.35f));
+        g.setColour(col);
+        g.drawLine(x, y, x - drift * 0.03f, y + 2.0f + p.speed * 2.5f, r * 1.1f);
+        g.setColour(juce::Colour::fromFloatRGBA(1.0f, 0.97f, 0.85f, al));
+        g.fillEllipse(x - r * 0.6f, y - r * 0.6f, r * 1.2f, r * 1.2f);
     }
 
     // pressure weight valve on top: rocks faster and faster
@@ -571,6 +575,59 @@ void Editor::drawGauge(juce::Graphics& g, float v, float lvl, float st, juce::Co
     }
 }
 
+void Editor::updateFire(float v, float lvl) {
+    constexpr int N = fireRes;
+    if (!fireImg.isValid()) {
+        fireImg = juce::Image(juce::Image::ARGB, N, N, true);
+        fireGlow = juce::Image(juce::Image::ARGB, N / 4, N / 4, true);
+    }
+    const float BR = 104.0f, R0 = fireRadius;
+    const float tt = (float) std::fmod(t, 1000.0);
+    const float react = 0.85f + 0.3f * lvl;
+    const float maxLen = (22.0f + 87.0f * std::pow(v, 0.8f)) * react;
+    const float sp = 1.6f + v * 2.2f;
+    const float blue = juce::jlimit(0.0f, 1.0f, 1.0f - v * 1.6f);
+    static const float stops[5][4] { { 0.0f, 90, 10, 0 }, { 0.25f, 200, 40, 5 }, { 0.5f, 255, 120, 20 }, { 0.75f, 255, 200, 70 }, { 1.0f, 255, 250, 215 } };
+    juce::Image::BitmapData bd(fireImg, juce::Image::BitmapData::writeOnly);
+    for (int y = 0; y < N; ++y) {
+        const float ly = ((float) y / (float) (N - 1) * 2.0f - 1.0f) * R0;
+        for (int x = 0; x < N; ++x) {
+            const float lx = ((float) x / (float) (N - 1) * 2.0f - 1.0f) * R0;
+            float q = 0.0f;
+            const float r0 = std::hypot(lx, ly);
+            const float d0 = r0 - BR + 6.0f;
+            if (d0 > -2.0f && d0 < maxLen * 1.6f + 10.0f) {
+                // flames bend upward: the source of a point is a bit below it
+                const float py = ly + 0.9f * juce::jlimit(0.0f, 50.0f, d0);
+                const float rr = std::hypot(lx, py);
+                const float d = rr - BR + 6.0f;
+                const float sinA = py / juce::jmax(1.0f, rr);
+                const float m = 0.08f + 0.92f * sstep(-0.7f, 0.45f, sinA);
+                const float n = fbm(lx * 0.05f, ly * 0.016f + tt * sp) * 0.7f + fbm(lx * 0.11f, ly * 0.035f + tt * sp * 1.6f) * 0.3f;
+                const float len = maxLen * m * (0.08f + 2.2f * n * n * n);
+                q = d > 0.0f ? juce::jlimit(0.0f, 1.0f, 1.0f - d / juce::jmax(1.0f, len)) : juce::jlimit(0.0f, 1.0f, 0.6f + d * 0.1f);
+                q *= sstep(-2.0f, 3.0f, d0) * sstep(-BR - maxLen * 0.5f, -BR * 0.2f, ly);
+            }
+            int k = 1;
+            while (k < 4 && q > stops[k][0]) ++k;
+            const float u = juce::jlimit(0.0f, 1.0f, (q - stops[k - 1][0]) / (stops[k][0] - stops[k - 1][0]));
+            float R = stops[k - 1][1] + (stops[k][1] - stops[k - 1][1]) * u;
+            float G = stops[k - 1][2] + (stops[k][2] - stops[k - 1][2]) * u;
+            float B = stops[k - 1][3] + (stops[k][3] - stops[k - 1][3]) * u;
+            // gas-blue at the root when the fire is low
+            const float base = blue * sstep(10.0f, 0.0f, d0) * juce::jlimit(0.0f, 1.0f, q * 3.0f);
+            R += (70.0f - R) * base; G += (130.0f - G) * base; B += (255.0f - B) * base;
+            const float A = juce::jlimit(0.0f, 1.0f, q * 3.2f);
+            bd.setPixelColour(x, y, juce::Colour::fromFloatRGBA(R / 255.0f, G / 255.0f, B / 255.0f, A));
+        }
+    }
+    // soft glow: a tiny copy of the flames, scaled up later
+    juce::Graphics gg(fireGlow);
+    fireGlow.clear(fireGlow.getBounds());
+    gg.setImageResamplingQuality(juce::Graphics::mediumResamplingQuality);
+    gg.drawImage(fireImg, fireGlow.getBounds().toFloat());
+}
+
 void Editor::drawCreator(juce::Graphics& g, juce::Colour heat) {
     const juce::Rectangle<float> panel(22, 196, (float) W - 44, 404);
     well(g, panel, 14.0f);
@@ -621,10 +678,35 @@ void Editor::drawCreator(juce::Graphics& g, juce::Colour heat) {
             g.drawText(juce::String(juce::CharPointer_UTF8("\xe2\x80\xba")), chip.withTrimmedLeft(chip.getWidth() - 14).translated(-3, -1), juce::Justification::centred);
         }
     }
-    g.setColour(juce::Colour(0xff8a8a98));
-    g.setFont(interRegular(11.5f));
-    g.drawText(utf8("Segure um slider pra ouvir no 100%. Duplo clique zera."), juce::Rectangle<float>(22, 602, (float) W - 44, 20),
-               juce::Justification::centred);
+    // explanation only on mouse-over
+    bool onChip = false, chipNext = false;
+    const int hr = dragRow >= 0 ? -1 : rowAt(hover.toFloat(), onChip, chipNext);
+    if (hr >= 0 || tipRowOverride >= 0) {
+        const int i = tipRowOverride >= 0 ? tipRowOverride : hr;
+        static const char* tips[] {
+            "Corta o grave subindo. No 100% do knob chega at\xc3\xa9 aqui.",
+            "Abafa o som. FECHA s\xc3\xb3 fecha, FECHA+SOBE fecha e depois abre com o high pass.",
+            "Quanto de reverb no 100%. SALA, HALL ou C\xc3\x89U.",
+            "Eco no tempo da m\xc3\xbasica.",
+            "FECHA deixa mono, ABRE alarga.",
+            "Chiado de riser que sobe junto.",
+            "Picota o som no tempo.",
+            "Satura e engorda.",
+        };
+        const auto text = utf8(tips[i]) + utf8("  Segure pra ouvir no 100%.");
+        const float y = rowTop + (float) (i + 1) * rowH + 2.0f;
+        juce::AttributedString as;
+        as.append(text, interRegular(12.0f), juce::Colour(0xff16161a));
+        as.setWordWrap(juce::AttributedString::byWord);
+        juce::TextLayout tl;
+        tl.createLayout(as, 236.0f);
+        const juce::Rectangle<float> box(juce::jlimit(30.0f, (float) W - 30.0f - 256.0f, trackX - 40.0f), y, 256.0f, tl.getHeight() + 16.0f);
+        g.setColour(juce::Colours::black.withAlpha(0.4f));
+        g.fillRoundedRectangle(box.translated(0, 3), 8.0f);
+        g.setColour(juce::Colour(0xfff4f4f7));
+        g.fillRoundedRectangle(box, 8.0f);
+        tl.draw(g, box.reduced(10, 8));
+    }
 }
 
 int Editor::rowAt(juce::Point<float> p, bool& onChip, bool& chipNext) const {

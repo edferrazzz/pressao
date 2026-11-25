@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.22)
 # must come before project(), or Xcode stamps the runner's own macOS version as the minimum
 set(CMAKE_OSX_DEPLOYMENT_TARGET "11.0" CACHE STRING "Minimum supported macOS version")
-project(Pressao VERSION 1.1.0 LANGUAGES C CXX)
+project(Pressao VERSION 1.2.0 LANGUAGES C CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 if(MSVC)
@@ -60,7 +60,7 @@ target_link_libraries(Pressao PRIVATE pressao_assets juce::juce_audio_utils juce
 juce_add_console_app(pressao_tests PRODUCT_NAME "Pressao Tests")
 target_sources(pressao_tests PRIVATE Tests/Tests.cpp ${PRESSAO_SOURCES})
 target_include_directories(pressao_tests PRIVATE Source)
-target_compile_definitions(pressao_tests PRIVATE ${PRESSAO_DEFINITIONS} JucePlugin_VersionString="1.1.0"
+target_compile_definitions(pressao_tests PRIVATE ${PRESSAO_DEFINITIONS} JucePlugin_VersionString="1.2.0"
  JUCE_STANDALONE_APPLICATION=1)
 target_link_libraries(pressao_tests PRIVATE pressao_assets juce::juce_audio_utils juce::juce_audio_processors juce::juce_dsp
  PUBLIC juce::juce_recommended_config_flags)

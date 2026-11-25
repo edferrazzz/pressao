@@ -208,6 +208,7 @@ void writeSnapshots(const juce::File& dir) {
     }
     proc.presetParam->setValueNotifyingHost(proc.presetParam->convertTo0to1(5.0f));
     ed.setCreating(true);
+    ed.tipRowOverride = 2;
     {
         auto cimg = ed.renderFrame(0.5f, 2.0);
         auto cf = dir.getChildFile("6-criar.png");
@@ -215,6 +216,7 @@ void writeSnapshots(const juce::File& dir) {
         juce::PNGImageFormat cpng;
         if (auto out = cf.createOutputStream()) cpng.writeImageToStream(cimg, *out);
     }
+    ed.tipRowOverride = -1;
     ed.setCreating(false);
     auto drop = ed.renderFrame(0.0f, 3.0, false, 0.35);
     {

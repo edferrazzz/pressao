@@ -37,6 +37,7 @@ private:
     void drawFooter(juce::Graphics&, juce::Colour heat);
     void drawInfo(juce::Graphics&);
     void drawCreator(juce::Graphics&, juce::Colour heat);
+    void updateFire(float v, float audio);
     int rowAt(juce::Point<float>, bool& onChip, bool& chipNext) const;
     void setRowFromX(int row, float x);
     void setAmount(float value01);
@@ -56,6 +57,12 @@ private:
     int dragRow = -1;
     const juce::Rectangle<float> criarBtn { 258, 20, 80, 32 };
     juce::Point<int> hover;
+    static constexpr int fireRes = 150;
+    static constexpr float fireRadius = 190.0f;
+    juce::Image fireImg, fireGlow;
+public:
+    int tipRowOverride = -1;   // tests: show a tooltip in snapshots
+private:
 
     const juce::Rectangle<float> infoBtn { 346, 20, 32, 32 };
     const juce::Rectangle<float> leftArrow { 22, 124, 46, 56 };
