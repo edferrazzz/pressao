@@ -34,11 +34,14 @@ Levels levelsFor(const Preset& pr, float p) {
     l.reverb = ramp(pr.reverb, p);
     l.mono = ramp(pr.mono, p);
     l.gate = ramp(pr.gate, p);
+    l.delay = ramp(pr.delay, p);
+    l.noise = ramp(pr.noise, p);
+    l.widen = ramp(pr.widen, p);
     if (pr.filter == FilterShape::closeThenRise) {
         // low pass closes over the first half, then reopens while the high pass rises
         const float split = 0.55f;
-        l.lowpass = p < split ? smoothstep(p / split) : 1.0f - smoothstep((p - split) / 0.25f);
-        l.highpass = smoothstep((p - split) / (1.0f - split));
+        l.lowpass = pr.lowpass.amount * (p < split ? smoothstep(p / split) : 1.0f - smoothstep((p - split) / 0.25f));
+        l.highpass = pr.highpass.amount * smoothstep((p - split) / (1.0f - split));
     } else {
         l.lowpass = ramp(pr.lowpass, p);
         l.highpass = ramp(pr.highpass, p);
@@ -62,7 +65,11 @@ void Engine::prepare(double sampleRate, int block) {
         lp[c].setResonance(0.9f); hp[c].setResonance(0.9f);
     }
     reverb.prepare({ sr, (juce::uint32) maxBlock, 2 });
+    for (auto& b : delayBuf) b.assign((size_t) (sr * 2.5), 0.0f);
+    noiseBp.prepare(spec); noiseBp.setType(juce::dsp::StateVariableTPTFilterType::bandpass); noiseBp.setResonance(1.2f);
+    for (auto& f : reverbHp) { f.prepare(spec); f.setType(juce::dsp::StateVariableTPTFilterType::highpass); f.setCutoffFrequency(250.0f); }
     dry.setSize(2, maxBlock);
+    wet.setSize(2, maxBlock);
     knob.reset(sr, 0.05);
     reset();
 }
@@ -73,6 +80,10 @@ void Engine::reset() {
     crushHold[0] = crushHold[1] = 0.0f; crushCount = 0.0f;
     for (int c = 0; c < 2; ++c) { lp[c].reset(); hp[c].reset(); }
     reverb.reset();
+    for (auto& b : delayBuf) std::fill(b.begin(), b.end(), 0.0f);
+    delayPos = 0;
+    noiseBp.reset(); inputEnv = 0.0f; peakKnob = 0.0f;
+    for (auto& f : reverbHp) f.reset();
     gatePhase = 0.0; gateGain = 1.0f;
     dryMs = wetMs = 0.0; outGain = 1.0f;
 }
@@ -86,17 +97,31 @@ void Engine::updateFilters(const Levels& l) {
 }
 
 void Engine::process(juce::AudioBuffer<float>& buffer, float amount, int presetIndex, const HostTime& time) {
+    process(buffer, amount, presets()[(size_t) juce::jlimit(0, numPresets - 1, presetIndex)], presetIndex, time);
+}
+
+void Engine::process(juce::AudioBuffer<float>& buffer, float amount, const Preset& pr, int presetIndex, const HostTime& time) {
     const int ch = juce::jmin(2, buffer.getNumChannels());
     const int n = buffer.getNumSamples();
     if (ch == 0 || n == 0) return;
-    presetIndex = juce::jlimit(0, numPresets - 1, presetIndex);
-    const Preset& pr = presets()[(size_t) presetIndex];
     if (presetIndex != lastPreset) {
         if (lastPreset >= 0) reverb.reset();
         lastPreset = presetIndex;
     }
 
-    knob.setTargetValue(juce::jlimit(0.0f, 1.0f, amount));
+    amount = juce::jlimit(0.0f, 1.0f, amount);
+    // The drop: the knob went up and is now back at (almost) 0 -> cut every tail, go dry right away.
+    peakKnob = juce::jmax(peakKnob, amount);
+    if (amount < 0.02f && peakKnob > 0.25f) {
+        reverb.reset();
+        for (auto& b : delayBuf) std::fill(b.begin(), b.end(), 0.0f);
+        knob.setCurrentAndTargetValue(amount);
+        peakKnob = 0.0f;
+        outGain = 1.0f; dryMs = wetMs = 0.0;
+        compEnv = 0.0f; gateGain = 1.0f;
+    }
+    if (amount < 0.02f) peakKnob = juce::jmin(peakKnob, 0.25f);
+    knob.setTargetValue(amount);
     for (int c = 0; c < ch; ++c) dry.copyFrom(c, 0, buffer, c, 0, n);
 
     // The knob is smoothed per block (blocks are short), levels computed once per block.
@@ -154,6 +179,8 @@ void Engine::process(juce::AudioBuffer<float>& buffer, float amount, int presetI
 
     // ---- base rate: filters, gate, mono ----
     updateFilters(l);
+    const float q = pr.resonant ? 2.6f : 0.9f;
+    for (int c = 0; c < 2; ++c) { lp[c].setResonance(q); hp[c].setResonance(q); }
     const bool useLp = l.lowpassHz < 19000.0f, useHp = l.highpassHz > 22.0f;
     // gate: divisions per beat accelerate with the knob: 1/4 -> 1/8 -> 1/16 -> 1/32
     const double perBeat = std::pow(2.0, std::floor(juce::jmin(3.0f, l.gate * 3.99f)));
@@ -161,7 +188,10 @@ void Engine::process(juce::AudioBuffer<float>& buffer, float amount, int presetI
     if (time.hasPpq) gatePhase = time.ppq * perBeat;
     const float gateSmooth = (float) std::exp(-1.0 / (0.002 * sr));
     const float depth = juce::jmin(1.0f, l.gate * 1.3f);
-    const float width = 1.0f - l.mono;
+    const float width = (1.0f - l.mono) * (1.0f + 0.9f * l.widen);
+    const float envRel = (float) std::exp(-1.0 / (0.4 * sr));
+    const float noiseGain = 0.9f * l.noise * l.noise;
+    if (l.noise > 0.0f) noiseBp.setCutoffFrequency(juce::jmin((float) sr * 0.4f, 600.0f * std::pow(16.0f, l.noise)));
     for (int i = 0; i < n; ++i) {
         for (int c = 0; c < ch; ++c) {
             float x = buffer.getSample(c, i);
@@ -176,7 +206,15 @@ void Engine::process(juce::AudioBuffer<float>& buffer, float amount, int presetI
             for (int c = 0; c < ch; ++c) buffer.setSample(c, i, buffer.getSample(c, i) * gateGain);
         }
         gatePhase += beatsPerSample * perBeat;
-        if (ch == 2 && l.mono > 0.0f) {
+        if (l.noise > 0.0f) {
+            // white noise through a band pass that climbs, following the music's level
+            float in = 0.0f;
+            for (int c = 0; c < ch; ++c) in = juce::jmax(in, std::abs(dry.getSample(c, i)));
+            inputEnv = in > inputEnv ? in : inputEnv * envRel;
+            const float nz = noiseBp.processSample(0, noiseRng.nextFloat() * 2.0f - 1.0f) * noiseGain * inputEnv;
+            for (int c = 0; c < ch; ++c) buffer.setSample(c, i, buffer.getSample(c, i) + nz * (c == 0 ? 1.0f : 0.9f));
+        }
+        if (ch == 2 && (l.mono > 0.0f || l.widen > 0.0f)) {
             const float a = buffer.getSample(0, i), b = buffer.getSample(1, i);
             const float m = 0.5f * (a + b), s = 0.5f * (a - b) * width;
             buffer.setSample(0, i, m + s);
@@ -186,19 +224,50 @@ void Engine::process(juce::AudioBuffer<float>& buffer, float amount, int presetI
     if (!useLp) for (auto& f : lp) f.reset();
     if (!useHp) for (auto& f : hp) f.reset();
 
-    // ---- reverb ----
+    // ---- delay: dotted 1/8 ping-pong in time, feedback climbs ----
+    if (l.delay > 0.001f) {
+        const int len = (int) delayBuf[0].size();
+        const int dt = juce::jlimit(1, len - 1, (int) std::lround(sr * 60.0 / juce::jmax(40.0, time.bpm) * (pr.delayDiv == 1 ? 1.0 : pr.delayDiv == 2 ? 0.25 : 0.75)));
+        const float fb = 0.3f + 0.45f * l.delay, mix = 0.6f * l.delay;
+        for (int i = 0; i < n; ++i) {
+            int rp = delayPos - dt; if (rp < 0) rp += len;
+            const float l0 = delayBuf[0][(size_t) rp], r0 = delayBuf[1][(size_t) rp];
+            const float inL = buffer.getSample(0, i), inR = buffer.getSample(ch > 1 ? 1 : 0, i);
+            delayBuf[0][(size_t) delayPos] = 0.5f * (inL + inR) * 0.7f + r0 * fb;   // ping-pong
+            delayBuf[1][(size_t) delayPos] = l0 * fb;
+            buffer.setSample(0, i, inL + mix * l0);
+            if (ch > 1) buffer.setSample(1, i, inR + mix * r0);
+            if (++delayPos == len) delayPos = 0;
+        }
+    }
+
+    // ---- reverb: the riser wash, fed without the low end ----
+    float wetShare = 0.0f;
     if (l.reverb > 0.001f) {
         juce::Reverb::Parameters rp;
-        rp.roomSize = 0.55f + 0.42f * l.reverb;
-        rp.damping = 0.35f;
-        rp.wetLevel = 0.55f * l.reverb;
-        rp.dryLevel = 1.0f - 0.4f * l.reverb;
+        if (pr.reverbType == 0) { rp.roomSize = 0.45f + 0.3f * l.reverb; rp.damping = 0.5f; }        // SALA
+        else if (pr.reverbType == 2) { rp.roomSize = 0.8f + 0.195f * l.reverb; rp.damping = 0.1f; } // CÉU
+        else { rp.roomSize = 0.6f + 0.39f * l.reverb; rp.damping = 0.25f; }                          // HALL
+        rp.wetLevel = 1.0f;
+        rp.dryLevel = 0.0f;
         rp.width = 1.0f;
         reverb.setParameters(rp);
-        juce::dsp::AudioBlock<float> b(buffer.getArrayOfWritePointers(), (size_t) ch, (size_t) n);
+        for (int c = 0; c < ch; ++c) wet.copyFrom(c, 0, buffer, c, 0, n);
+        for (int c = 0; c < ch; ++c) {
+            float* w = wet.getWritePointer(c);
+            for (int i = 0; i < n; ++i) w[i] = reverbHp[c].processSample(0, w[i]);
+        }
+        juce::dsp::AudioBlock<float> b(wet.getArrayOfWritePointers(), (size_t) ch, (size_t) n);
         juce::dsp::ProcessContextReplacing<float> ctx(b);
         reverb.process(ctx);
+        wetShare = l.reverb;
+        const float dryG = 1.0f - 0.6f * l.reverb * l.reverb, wetG = 0.75f * l.reverb;
+        for (int c = 0; c < ch; ++c) {
+            buffer.applyGain(c, 0, n, dryG);
+            buffer.addFrom(c, 0, wet, c, 0, n, wetG);
+        }
     }
+    steamMeter.store(juce::jmax(wetShare, l.delay * 0.8f, l.noise * 0.8f));
 
     // ---- loudness match: the knob changes the character, not just the volume ----
     double d = 0.0, w = 0.0;
@@ -212,7 +281,11 @@ void Engine::process(juce::AudioBuffer<float>& buffer, float amount, int presetI
     dryMs += k * (d / cnt - dryMs);
     wetMs += k * (w / cnt - wetMs);
     float target = outGain;
-    if (dryMs > 1.0e-9 && wetMs > 1.0e-12) target = juce::jlimit(0.2f, 3.0f, (float) std::sqrt(dryMs / wetMs));
+    if (dryMs > 1.0e-9 && wetMs > 1.0e-12) {
+        // only part of the way: a riser is allowed to thin out, just not to vanish or blow up
+        const float matchDb = juce::Decibels::gainToDecibels((float) std::sqrt(dryMs / wetMs));
+        target = juce::Decibels::decibelsToGain(juce::jlimit(-12.0f, 9.0f, matchDb * 0.7f));
+    }
     // a little louder as the pressure builds
     target *= juce::Decibels::decibelsToGain(2.0f * p);
     for (int c = 0; c < ch; ++c) buffer.applyGainRamp(c, 0, n, outGain, target);

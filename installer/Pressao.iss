@@ -1,6 +1,6 @@
 ﻿; Windows installer for PRESSÃO (VST3).
 #ifndef AppVersion
-  #define AppVersion "1.0.0"
+  #define AppVersion "1.1.0"
 #endif
 #ifndef DistDir
   #define DistDir "..\dist"

@@ -25,26 +25,36 @@ public:
     static constexpr int W = 400, H = 680;
 
     // Tests: draw one frame at a fixed knob value and animation time.
-    juce::Image renderFrame(float value, double time, bool showInfo = false);
+    juce::Image renderFrame(float value, double time, bool showInfo = false, double burstAge = -1.0);
+    void setCreating(bool);   // CRIAR mode (MEU PRESET ceilings)
 
 private:
     void timerCallback() override;
     void drawBackground(juce::Graphics&, float v, juce::Colour heat);
     void drawHeader(juce::Graphics&, float v, juce::Colour heat, float sx, float sy);
     void drawPresetRow(juce::Graphics&);
-    void drawGauge(juce::Graphics&, float v, float audio, juce::Colour heat, float sx, float sy);
+    void drawGauge(juce::Graphics&, float v, float audio, float steam, juce::Colour heat, float sx, float sy);
     void drawFooter(juce::Graphics&, juce::Colour heat);
     void drawInfo(juce::Graphics&);
+    void drawCreator(juce::Graphics&, juce::Colour heat);
+    int rowAt(juce::Point<float>, bool& onChip, bool& chipNext) const;
+    void setRowFromX(int row, float x);
     void setAmount(float value01);
 
     Processor& proc;
     double t = 0.0;
     float shown = 0.0f;      // smoothed knob value for the drawing
     float audio = 0.0f;      // smoothed output level
+    float steamLevel = 0.0f; // smoothed reverb/riser amount
+    float lastTarget = 0.0f;
+    double burstStart = -10.0;   // the drop: big steam release
     bool infoOpen = false;
     bool dragging = false;
     float dragStart = 0.0f;
     std::optional<float> overrideValue;
+    bool creating = false;
+    int dragRow = -1;
+    const juce::Rectangle<float> criarBtn { 258, 20, 80, 32 };
     juce::Point<int> hover;
 
     const juce::Rectangle<float> infoBtn { 346, 20, 32, 32 };

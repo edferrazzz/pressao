@@ -2,6 +2,7 @@
 
 #include <juce_audio_processors/juce_audio_processors.h>
 #include "Engine.h"
+#include <atomic>
 
 namespace pressao {
 
@@ -24,7 +25,7 @@ public:
     double getTailLengthSeconds() const override { return 3.0; }
 
     // Presets are also exposed as host programs.
-    int getNumPrograms() override { return numPresets; }
+    int getNumPrograms() override { return numSlots; }
     int getCurrentProgram() override { return presetIndex(); }
     void setCurrentProgram(int) override;
     const juce::String getProgramName(int) override;
@@ -38,6 +39,7 @@ public:
     int presetIndex() const { return presetParam->getIndex(); }
     bool isBypassed() const { return bypassParam->get(); }
     float level() const { return engine.level(); }
+    float steam() const { return engine.steam(); }
     void stepPreset(int delta);
     void choosePreset(int index);
 
@@ -45,11 +47,21 @@ public:
     juce::AudioParameterChoice* presetParam = nullptr;
     juce::AudioParameterBool* bypassParam = nullptr;
 
-    static juce::String presetName(int index);   // "SÓ PRESSÃO" (UTF-8 safe)
+    static juce::String presetName(int index);   // "SUBIDA" ... "MEU PRESET" (UTF-8 safe)
+
+    // MEU PRESET (message thread)
+    Custom getCustom() const;
+    void setCustom(const Custom&);
+    Preset slotPreset(int index) const;          // factory or MEU PRESET
+    std::atomic<bool> previewTop { false };      // CRIAR: play at knob 100 while a slider is held
     static juce::String versionString() { return JucePlugin_VersionString; }
 
 private:
     Engine engine;
+    Custom custom;
+    Preset customPreset = toPreset(Custom {});
+    Preset audioCustom = customPreset;           // audio thread copy
+    mutable juce::SpinLock customLock;
 };
 
 } // namespace pressao

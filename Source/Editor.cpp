@@ -124,6 +124,41 @@ void well(juce::Graphics& g, juce::Rectangle<float> r, float radius, bool over =
     g.setColour(over ? juce::Colour(0xff3a3a44) : juce::Colour(0xff26262c));
     g.drawRoundedRectangle(r.reduced(0.5f), radius, 1.0f);
 }
+
+struct RowDef {
+    const char* label;
+    float Custom::* value;
+    int Custom::* type;
+    std::vector<const char*> types;
+};
+
+const std::vector<RowDef>& rowDefs() {
+    static const std::vector<RowDef> rows {
+        { "HIGH PASS", &Custom::highpass, &Custom::highpassType, { "SUAVE", "RESSONA" } },
+        { "LOW PASS", &Custom::lowpass, &Custom::lowpassType, { "FECHA", "FECHA+SOBE" } },
+        { "REVERB", &Custom::reverb, &Custom::reverbType, { "SALA", "HALL", "C\xc3\x89U" } },
+        { "DELAY", &Custom::delay, &Custom::delayDiv, { "1/8 PONTO", "1/4", "1/16" } },
+        { "EST\xc3\x89REO", &Custom::stereo, &Custom::stereoType, { "FECHA", "ABRE" } },
+        { "RU\xc3\x8d" "DO", &Custom::noise, nullptr, {} },
+        { "GATE", &Custom::gate, nullptr, {} },
+        { "GORDURA", &Custom::drive, nullptr, {} },
+    };
+    return rows;
+}
+
+constexpr float rowTop = 206.0f, rowH = 48.0f, trackX = 150.0f;
+float trackWidth(const RowDef& r) { return r.type != nullptr ? 118.0f : 212.0f; }
+juce::Rectangle<float> chipRect(int i) { return { 282.0f, rowTop + (float) i * rowH + 9.0f, 86.0f, 30.0f }; }
+
+juce::String rowValue(int i, const Custom& c) {
+    const auto& r = rowDefs()[(size_t) i];
+    const float v = c.*(r.value);
+    if (v < 0.005f) return "desligado";
+    auto hz = [](float f) { return f >= 1000.0f ? juce::String(f / 1000.0f, 1) + " kHz" : juce::String((int) std::lround(f)) + " Hz"; };
+    if (i == 0) return juce::String(juce::CharPointer_UTF8("at\xc3\xa9 ")) + hz(20.0f * std::pow(customHighpassMaxHz / 20.0f, v));
+    if (i == 1) return juce::String(juce::CharPointer_UTF8("at\xc3\xa9 ")) + hz(20000.0f * std::pow(customLowpassMinHz / 20000.0f, v));
+    return juce::String((int) std::lround(v * 100.0f)) + "%";
+}
 } // namespace
 
 // ===========================================================================
@@ -141,14 +176,18 @@ void Editor::timerCallback() {
     const float target = proc.isBypassed() ? 0.0f : proc.amount();
     shown += (target - shown) * 0.35f;
     audio += (juce::jmin(1.0f, proc.level()) - audio) * 0.3f;
+    steamLevel += (proc.steam() - steamLevel) * 0.15f;
+    if (target < 0.02f && lastTarget > 0.3f) burstStart = t;   // the drop: release the valve
+    lastTarget = target;
     repaint();
 }
 
-juce::Image Editor::renderFrame(float value, double time, bool showInfo) {
+juce::Image Editor::renderFrame(float value, double time, bool showInfo, double burstAge) {
     overrideValue = value;
     t = time;
     infoOpen = showInfo;
     audio = 0.6f;
+    burstStart = burstAge >= 0.0 ? time - burstAge : -10.0;
     juce::Image img(juce::Image::ARGB, W * 2, H * 2, true);
     {
         juce::Graphics g(img);
@@ -163,12 +202,14 @@ juce::Image Editor::renderFrame(float value, double time, bool showInfo) {
 void Editor::paint(juce::Graphics& g) {
     const float v = overrideValue ? *overrideValue : shown;
     const auto heat = heatColour(v);
-    const float shakeAmt = std::pow(juce::jmax(0.0f, v - 0.6f) / 0.4f, 2.0f) * 6.0f;
+    const float shakeAmt = std::pow(juce::jmax(0.0f, v - 0.75f) / 0.25f, 2.0f) * 2.5f;
     const float sx = (float) (std::sin(t * 91.0) + std::sin(t * 57.0)) * shakeAmt * 0.5f;
     const float sy = (float) (std::cos(t * 83.0) + std::sin(t * 67.0)) * shakeAmt * 0.5f;
 
     drawBackground(g, v, heat);
-    drawGauge(g, v, overrideValue ? 0.6f : audio, heat, sx, sy);
+    const float st = overrideValue ? *overrideValue : juce::jmax(steamLevel, v * 0.6f);
+    if (creating) drawCreator(g, heat);
+    else drawGauge(g, v, overrideValue ? 0.6f : audio, st, heat, sx, sy);
     drawHeader(g, v, heat, sx, sy);
     drawPresetRow(g);
     drawFooter(g, heat);
@@ -218,6 +259,17 @@ void Editor::drawHeader(juce::Graphics& g, float v, juce::Colour heat, float sx,
         g.setFont(interBold(14.0f));
         g.drawText("i", infoBtn, juce::Justification::centred);
     }
+    // CRIAR / PRONTO
+    {
+        const bool over = criarBtn.contains(hover.toFloat());
+        g.setColour(creating ? heat : juce::Colour(0xff121216));
+        g.fillRoundedRectangle(criarBtn, 9.0f);
+        g.setColour(creating ? heat : (over ? juce::Colour(0xff4a4a55) : juce::Colour(0xff2b2b33)));
+        g.drawRoundedRectangle(criarBtn.reduced(0.5f), 9.0f, 1.0f);
+        g.setColour(creating ? juce::Colour(0xff160a02) : juce::Colour(0xffcfcfda));
+        g.setFont(interBold(11.0f).withExtraKerningFactor(0.12f));
+        g.drawText(creating ? "PRONTO" : "CRIAR", criarBtn, juce::Justification::centred);
+    }
     // title with heat glow
     {
         const auto text = utf8("PRESSÃO");
@@ -238,7 +290,18 @@ void Editor::drawHeader(juce::Graphics& g, float v, juce::Colour heat, float sx,
 
 void Editor::drawPresetRow(juce::Graphics& g) {
     const int idx = proc.presetIndex();
-    const auto& pr = presets()[(size_t) idx];
+    const auto pr = proc.slotPreset(idx);
+    if (creating) {
+        const auto box = presetBox.withX(leftArrow.getX()).withRight(rightArrow.getRight());
+        well(g, box, 12.0f);
+        g.setColour(juce::Colour(0xffeceef6));
+        g.setFont(interBold(15.5f).withExtraKerningFactor(0.12f));
+        g.drawText("MEU PRESET", box.withHeight(30.0f).translated(0, 5), juce::Justification::centred);
+        g.setColour(juce::Colour(0xff9a9aaa));
+        g.setFont(interRegular(11.5f));
+        g.drawText(utf8("o 100% do knob chega nesses tetos"), box.withTrimmedTop(30.0f).withHeight(18.0f), juce::Justification::centred);
+        return;
+    }
     well(g, leftArrow, 12.0f, leftArrow.contains(hover.toFloat()));
     well(g, rightArrow, 12.0f, rightArrow.contains(hover.toFloat()));
     chevron(g, leftArrow, false, juce::Colour(0xffcfcfda));
@@ -246,7 +309,7 @@ void Editor::drawPresetRow(juce::Graphics& g) {
     well(g, presetBox, 12.0f, presetBox.contains(hover.toFloat()));
 
     // "02  FECHA E SOBE"
-    const auto num = juce::String(idx + 1).paddedLeft('0', 2);
+    const auto num = idx == customSlot ? juce::String(juce::CharPointer_UTF8("\xe2\x98\x85")) : juce::String(idx + 1).paddedLeft('0', 2);
     const auto name = utf8(pr.name);
     const auto fNum = interBold(15.5f).withExtraKerningFactor(0.12f);
     const auto fName = interBold(15.5f).withExtraKerningFactor(0.12f);
@@ -280,7 +343,7 @@ void Editor::drawPresetRow(juce::Graphics& g) {
     }
 }
 
-void Editor::drawGauge(juce::Graphics& g, float v, float lvl, juce::Colour c, float sx, float sy) {
+void Editor::drawGauge(juce::Graphics& g, float v, float lvl, float st, juce::Colour c, float sx, float sy) {
     juce::Graphics::ScopedSaveState save(g);
     constexpr float S = 1.15f;
     g.addTransform(juce::AffineTransform::scale(S).translated(gaugeCentre.x + sx, gaugeCentre.y + sy));
@@ -288,7 +351,7 @@ void Editor::drawGauge(juce::Graphics& g, float v, float lvl, juce::Colour c, fl
     const double tt = t;
 
     // glow
-    softBlob(g, 0.0f, 10.0f, 150.0f, c.withAlpha(0.2f + v * 0.5f));
+    softBlob(g, 0.0f, 10.0f, 150.0f, c.withAlpha(0.15f + v * 0.3f));
 
     // flames: a blue stove flame when low, orange/red fire when high; they dance with the audio
     const int NF = 46;
@@ -298,7 +361,7 @@ void Editor::drawGauge(juce::Graphics& g, float v, float lvl, juce::Colour c, fl
         const float a = (float) i / NF * 2.0f * pi;
         const float bottom = juce::jmax(0.0f, std::sin(a));
         const float n = flameNoise(i, tt * (1.0 + v));
-        const float L = (6.0f + v * 58.0f * react) * (0.55f + 0.6f * n) * (0.55f + 0.45f * bottom + 0.25f * (1.0f - bottom));
+        const float L = (5.0f + v * 26.0f * react) * (0.55f + 0.6f * n) * (0.55f + 0.45f * bottom + 0.25f * (1.0f - bottom));
         if (L < 4.0f) continue;
         float dx = std::cos(a), dy = std::sin(a) - (0.5f + v * 0.6f);
         const float dl = std::hypot(dx, dy);
@@ -351,14 +414,48 @@ void Editor::drawGauge(juce::Graphics& g, float v, float lvl, juce::Colour c, fl
         g.fillEllipse(-5, -41, 10, 10);
     }
 
-    // steam jet from the valve
-    for (const auto& s : steam()) {
-        if (s.k > 0.15f + v * 0.95f) continue;
-        const float life = (float) std::fmod(tt * s.speed * (0.8 + v * 1.4) + s.phase, 1.0);
-        const float x = s.dx * (6.0f + life * 40.0f * (0.4f + v)) + (float) std::sin(tt * 4.0 + s.phase * 7.0f) * 4.0f * life;
-        const float y = -BR - 40.0f - life * (50.0f + v * 55.0f);
-        const float r = s.size * (0.4f + life * 1.6f) * (0.5f + v * 0.8f);
-        softBlob(g, x, y, r, juce::Colour::fromFloatRGBA(0.94f, 0.94f, 0.97f, (1.0f - life) * (0.18f + v * 0.35f)));
+    // steam from the valve: this IS the reverb. More riser, more steam, filling the window.
+    {
+        const int count = 30 + (int) (st * 90.0f);
+        for (int i = 0; i < count; ++i) {
+            const auto& s = steam()[(size_t) (i % (int) steam().size())];
+            const float ph = s.phase + (float) (i / (int) steam().size()) * 0.37f;
+            const float life = (float) std::fmod(tt * s.speed * (0.45 + st * 0.9) + ph, 1.0);
+            const float spread = 8.0f + life * (30.0f + st * 150.0f);
+            const float x = s.dx * spread * 2.0f + (float) std::sin(tt * 1.3 + ph * 9.0f) * 10.0f * life;
+            const float y = -BR - 40.0f - life * (60.0f + st * 190.0f);
+            const float r = s.size * (0.5f + life * (1.5f + st * 3.0f)) * (0.6f + st * 0.7f);
+            const float a = (1.0f - life) * (life < 0.08f ? life / 0.08f : 1.0f) * (0.10f + st * 0.32f);
+            softBlob(g, x, y, r, juce::Colour::fromFloatRGBA(0.95f, 0.95f, 0.98f, a));
+        }
+        // a haze hanging over everything when the reverb is big
+        softBlob(g, 0.0f, -BR - 120.0f, 260.0f, juce::Colour::fromFloatRGBA(0.92f, 0.92f, 0.96f, st * st * 0.10f));
+        // the whistle: sound lines when it is at the top
+        if (v > 0.85f) {
+            const float wv = (v - 0.85f) / 0.15f;
+            for (int k = 0; k < 3; ++k) {
+                const float ph = (float) std::fmod(tt * 2.2 + k / 3.0, 1.0);
+                const float r = 14.0f + ph * 34.0f;
+                juce::Path arcL, arcR;
+                arcL.addCentredArc(0, -BR - 34.0f, r, r, 0.0f, -2.3f, -1.4f, true);
+                arcR.addCentredArc(0, -BR - 34.0f, r, r, 0.0f, 1.4f, 2.3f, true);
+                g.setColour(juce::Colours::white.withAlpha((1.0f - ph) * 0.6f * wv));
+                g.strokePath(arcL, juce::PathStrokeType(2.0f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
+                g.strokePath(arcR, juce::PathStrokeType(2.0f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
+            }
+        }
+        // the drop: the valve lets everything out at once
+        const double age = tt - burstStart;
+        if (age >= 0.0 && age < 1.2) {
+            const float u = (float) (age / 1.2);
+            for (int i = 0; i < 26; ++i) {
+                const auto& s = steam()[(size_t) i];
+                const float ang = -pi * 0.5f + (s.dx) * 2.4f;
+                const float dist = 20.0f + u * (140.0f + s.size * 8.0f);
+                const auto p = polar(ang, dist);
+                softBlob(g, p.x, -BR - 30.0f + p.y, 14.0f + u * 46.0f, juce::Colour::fromFloatRGBA(0.97f, 0.97f, 1.0f, (1.0f - u) * 0.45f));
+            }
+        }
     }
 
     // steel bezel, heating up
@@ -423,11 +520,11 @@ void Editor::drawGauge(juce::Graphics& g, float v, float lvl, juce::Colour c, fl
         g.setColour(juce::Colours::white);
         g.setFont(interBold(21.0f));
         g.drawText(juce::String((int) std::lround(v * 100.0f)), r, juce::Justification::centred);
-        const bool danger = v > 0.95f;
+        const bool danger = v > 0.95f;   // at the top: tell them what to do next
         const bool blink = std::sin(tt * 20.0) > 0.0;
         g.setColour(danger ? (blink ? juce::Colours::white : c) : juce::Colour(0xff7a7a88));
         g.setFont(interBold(8.5f));
-        g.drawText(danger ? "VAI ESTOURAR" : utf8("PRESSÃO"), juce::Rectangle<float>(-50, 62, 100, 12), juce::Justification::centred);
+        g.drawText(danger ? "SOLTA NO DROP" : utf8("PRESSÃO"), juce::Rectangle<float>(-50, 62, 100, 12), juce::Justification::centred);
     }
 
     // needle, trembling near the top
@@ -451,34 +548,18 @@ void Editor::drawGauge(juce::Graphics& g, float v, float lvl, juce::Colour c, fl
         juce::Path face;
         face.addEllipse(-FR, -FR, FR * 2, FR * 2);
         g.reduceClipRegion(face);
-        for (const auto& cr : cracks()) {
-            const float vis = (v - 0.6f - cr.threshold * 0.35f) / 0.15f;
-            if (vis <= 0.0f) continue;
-            const float u = juce::jmin(1.0f, vis);
-            auto draw = [&](const std::vector<juce::Point<float>>& pts, int count, float width, float alpha) {
-                juce::Path p;
-                for (int j = 0; j < count && j < (int) pts.size(); ++j) {
-                    const auto pt = polar(pts[(size_t) j].x, pts[(size_t) j].y * 0.62f);
-                    if (j == 0) p.startNewSubPath(pt); else p.lineTo(pt);
-                }
-                g.setColour(juce::Colours::white.withAlpha(alpha));
-                g.strokePath(p, juce::PathStrokeType(width, juce::PathStrokeType::mitered, juce::PathStrokeType::rounded));
-            };
-            draw(cr.pts, juce::jmax(2, (int) std::ceil((float) cr.pts.size() * u)), 1.1f, 0.75f);
-            if (u > 0.6f) draw(cr.branch, (int) std::ceil((float) cr.branch.size() * (u - 0.6f) / 0.4f), 0.8f, 0.45f);
-        }
         juce::Path hl;
         hl.addEllipse(-FR * 0.75f, -FR * 0.42f, FR * 1.5f, FR * 0.84f);
         hl.applyTransform(juce::AffineTransform::rotation(-0.5f).translated(-18.0f, -34.0f));
         g.setColour(juce::Colours::white.withAlpha(0.06f));
         g.fillPath(hl);
-        g.setColour(juce::Colour::fromFloatRGBA(0.9f, 0.9f, 0.94f, v * v * 0.08f));
+        g.setColour(juce::Colour::fromFloatRGBA(0.9f, 0.9f, 0.94f, st * st * 0.12f));
         g.fillEllipse(-FR, -FR, FR * 2, FR * 2);
     }
 
     // steam leaking from the sides when it is about to blow
     for (int lk = 0; lk < 6; ++lk) {
-        const float th = 0.55f + (float) lk * 0.07f;
+        const float th = 0.7f + (float) lk * 0.05f;
         if (v < th) continue;
         const float ph = (float) lk * 0.37f - std::floor((float) lk * 0.37f);
         const float a = -pi * 0.5f + (ph - 0.5f) * 2.6f;
@@ -488,6 +569,94 @@ void Editor::drawGauge(juce::Graphics& g, float v, float lvl, juce::Colour c, fl
             softBlob(g, p.x, p.y - life * 10.0f, 4.0f + life * 12.0f, juce::Colour::fromFloatRGBA(0.94f, 0.94f, 0.97f, (1.0f - life) * 0.35f));
         }
     }
+}
+
+void Editor::drawCreator(juce::Graphics& g, juce::Colour heat) {
+    const juce::Rectangle<float> panel(22, 196, (float) W - 44, 404);
+    well(g, panel, 14.0f);
+    const auto c = proc.getCustom();
+    const auto& rows = rowDefs();
+    for (int i = 0; i < (int) rows.size(); ++i) {
+        const auto& r = rows[(size_t) i];
+        const float y0 = rowTop + (float) i * rowH;
+        if (i > 0) {
+            g.setColour(juce::Colour(0xff1a1a20));
+            g.fillRect(34.0f, y0, panel.getWidth() - 24.0f, 1.0f);
+        }
+        const float v = c.*(r.value);
+        g.setColour(v > 0.005f ? juce::Colour(0xffeceef6) : juce::Colour(0xff8a8a98));
+        g.setFont(interBold(11.0f).withExtraKerningFactor(0.1f));
+        g.drawText(utf8(r.label), juce::Rectangle<float>(36, y0 + 8, 112, 16), juce::Justification::centredLeft);
+        g.setColour(v > 0.005f ? heat.brighter(0.2f) : juce::Colour(0xff5a5a66));
+        g.setFont(interRegular(11.5f));
+        g.drawText(rowValue(i, c), juce::Rectangle<float>(36, y0 + 24, 112, 16), juce::Justification::centredLeft);
+
+        const float tw = trackWidth(r);
+        const juce::Rectangle<float> track(trackX, y0 + 21.0f, tw, 6.0f);
+        g.setColour(juce::Colour(0xff1d1d23));
+        g.fillRoundedRectangle(track, 3.0f);
+        if (v > 0.0f) {
+            g.setGradientFill(juce::ColourGradient(heatColour(0.0f), track.getX(), 0, heatColour(v), track.getX() + tw * v, 0, false));
+            g.fillRoundedRectangle(track.withWidth(juce::jmax(6.0f, tw * v)), 3.0f);
+        }
+        const float hx = track.getX() + tw * v;
+        g.setColour(juce::Colours::white);
+        g.fillEllipse(hx - 7.0f, track.getCentreY() - 7.0f, 14.0f, 14.0f);
+        g.setColour(dragRow == i ? heat : juce::Colour(0xff2a2a30));
+        g.drawEllipse(hx - 7.0f, track.getCentreY() - 7.0f, 14.0f, 14.0f, 1.5f);
+
+        if (r.type != nullptr) {
+            const auto chip = chipRect(i);
+            g.setColour(juce::Colour(0xff15151a));
+            g.fillRoundedRectangle(chip, 8.0f);
+            g.setColour(juce::Colour(0xff2b2b33));
+            g.drawRoundedRectangle(chip.reduced(0.5f), 8.0f, 1.0f);
+            const int t = c.*(r.type);
+            g.setColour(juce::Colour(0xffeceef6));
+            g.setFont(interBold(10.0f).withExtraKerningFactor(0.06f));
+            g.drawText(utf8(r.types[(size_t) juce::jlimit(0, (int) r.types.size() - 1, t)]), chip.reduced(14, 0), juce::Justification::centred);
+            g.setColour(juce::Colour(0xff6c6c7a));
+            g.setFont(interBold(12.0f));
+            g.drawText(juce::String(juce::CharPointer_UTF8("\xe2\x80\xb9")), chip.withWidth(14).translated(3, -1), juce::Justification::centred);
+            g.drawText(juce::String(juce::CharPointer_UTF8("\xe2\x80\xba")), chip.withTrimmedLeft(chip.getWidth() - 14).translated(-3, -1), juce::Justification::centred);
+        }
+    }
+    g.setColour(juce::Colour(0xff8a8a98));
+    g.setFont(interRegular(11.5f));
+    g.drawText(utf8("Segure um slider pra ouvir no 100%. Duplo clique zera."), juce::Rectangle<float>(22, 602, (float) W - 44, 20),
+               juce::Justification::centred);
+}
+
+int Editor::rowAt(juce::Point<float> p, bool& onChip, bool& chipNext) const {
+    onChip = chipNext = false;
+    if (p.x < 22 || p.x > W - 22) return -1;
+    const int i = (int) std::floor((p.y - rowTop) / rowH);
+    if (i < 0 || i >= (int) rowDefs().size()) return -1;
+    const auto& r = rowDefs()[(size_t) i];
+    if (r.type != nullptr && chipRect(i).expanded(2).contains(p)) {
+        onChip = true;
+        chipNext = p.x > chipRect(i).getCentreX();
+        return i;
+    }
+    return p.x >= trackX - 14.0f ? i : -1;
+}
+
+void Editor::setRowFromX(int row, float x) {
+    auto c = proc.getCustom();
+    const auto& r = rowDefs()[(size_t) row];
+    c.*(r.value) = juce::jlimit(0.0f, 1.0f, (x - trackX) / trackWidth(r));
+    proc.setCustom(c);
+}
+
+void Editor::setCreating(bool on) {
+    if (on && proc.presetIndex() != customSlot) {
+        proc.setCustom(fromPreset(proc.slotPreset(proc.presetIndex())));   // start from what you were hearing
+        proc.choosePreset(customSlot);
+    }
+    creating = on;
+    proc.previewTop = false;
+    dragRow = -1;
+    repaint();
 }
 
 void Editor::drawFooter(juce::Graphics& g, juce::Colour heat) {
@@ -534,10 +703,10 @@ void Editor::drawInfo(juce::Graphics& g) {
     area.removeFromTop(6);
     g.setColour(juce::Colour(0xffc4c4d2));
     g.setFont(interRegular(13.0f));
-    const auto how = utf8("Gire o knob pra subir a pressão no pré-drop. Automatize o knob subindo até o drop e "
-                          "volte pro 0 no 1 do drop. Use as setinhas (ou clique no nome) pra trocar o preset. "
-                          "Duplo clique no knob volta pro 0.");
-    g.drawFittedText(how, area.removeFromTop(92).toNearestInt(), juce::Justification::topLeft, 6, 1.0f);
+    const auto how = utf8("Automatize o knob subindo no pré-drop e volte pro 0 no 1 do drop: o reverb é cortado na hora "
+                          "e o drop entra seco. Setinhas trocam o preset. CRIAR monta o seu: escolha até onde cada "
+                          "efeito vai no 100% do knob.");
+    g.drawFittedText(how, area.removeFromTop(66).toNearestInt(), juce::Justification::topLeft, 6, 1.0f);
     area.removeFromTop(6);
     g.setColour(juce::Colours::white);
     g.setFont(interBold(13.0f));
@@ -562,16 +731,36 @@ void Editor::mouseMove(const juce::MouseEvent& e) {
     hover = e.getPosition();
     const auto p = e.position;
     const bool clickable = infoBtn.contains(p) || leftArrow.contains(p) || rightArrow.contains(p) || presetBox.contains(p)
-                           || powerBtn.contains(p);
+                           || powerBtn.contains(p) || criarBtn.contains(p);
     setMouseCursor(clickable ? juce::MouseCursor::PointingHandCursor
-                             : (knobArea.contains(p) ? juce::MouseCursor::UpDownResizeCursor : juce::MouseCursor::NormalCursor));
+                             : (knobArea.contains(p) && !creating ? juce::MouseCursor::UpDownResizeCursor : juce::MouseCursor::NormalCursor));
 }
 
 void Editor::mouseDown(const juce::MouseEvent& e) {
     const auto p = e.position;
     if (infoOpen) { infoOpen = false; repaint(); return; }
     if (infoBtn.contains(p)) { infoOpen = true; repaint(); return; }
-    if (leftArrow.contains(p)) { proc.stepPreset(-1); return; }
+    if (criarBtn.contains(p)) { setCreating(!creating); return; }
+    if (creating) {
+        bool onChip = false, next = false;
+        const int row = rowAt(p, onChip, next);
+        if (row < 0) return;
+        const auto& r = rowDefs()[(size_t) row];
+        if (onChip) {
+            auto c = proc.getCustom();
+            const int n = (int) r.types.size();
+            c.*(r.type) = ((c.*(r.type)) + (next ? 1 : -1) + n) % n;
+            proc.setCustom(c);
+            repaint();
+            return;
+        }
+        dragRow = row;
+        setRowFromX(row, p.x);
+        proc.previewTop = true;
+        repaint();
+        return;
+    }
+    if (leftArrow.contains(p)) { proc.stepPreset(-1); return; }  // (not reached while creating)
     if (rightArrow.contains(p)) { proc.stepPreset(1); return; }
     if (powerBtn.contains(p)) {
         proc.bypassParam->beginChangeGesture();
@@ -583,11 +772,13 @@ void Editor::mouseDown(const juce::MouseEvent& e) {
         juce::PopupMenu m;
         for (int i = 0; i < numPresets; ++i)
             m.addItem(i + 1, juce::String(i + 1).paddedLeft('0', 2) + "  " + Processor::presetName(i), true, i == proc.presetIndex());
+        m.addSeparator();
+        m.addItem(customSlot + 1, Processor::presetName(customSlot), true, proc.presetIndex() == customSlot);
         m.showMenuAsync(juce::PopupMenu::Options().withTargetScreenArea(localAreaToGlobal(presetBox.toNearestInt())).withMinimumWidth(248),
                         [this](int r) { if (r > 0) proc.choosePreset(r - 1); });
         return;
     }
-    if (knobArea.contains(p)) {
+    if (knobArea.contains(p) && !creating) {
         dragging = true;
         dragStart = proc.amountParam->convertTo0to1(proc.amountParam->get());
         proc.amountParam->beginChangeGesture();
@@ -595,17 +786,25 @@ void Editor::mouseDown(const juce::MouseEvent& e) {
 }
 
 void Editor::mouseDrag(const juce::MouseEvent& e) {
+    if (dragRow >= 0) { setRowFromX(dragRow, e.position.x); repaint(); return; }
     if (!dragging) return;
     const float range = e.mods.isShiftDown() ? 1200.0f : 260.0f;
     setAmount(dragStart - (float) e.getDistanceFromDragStartY() / range);
 }
 
 void Editor::mouseUp(const juce::MouseEvent&) {
+    if (dragRow >= 0) { dragRow = -1; proc.previewTop = false; repaint(); }
     if (dragging) proc.amountParam->endChangeGesture();
     dragging = false;
 }
 
 void Editor::mouseDoubleClick(const juce::MouseEvent& e) {
+    if (creating) {
+        bool onChip = false, next = false;
+        const int row = rowAt(e.position, onChip, next);
+        if (row >= 0 && !onChip) { auto c = proc.getCustom(); c.*(rowDefs()[(size_t) row].value) = 0.0f; proc.setCustom(c); repaint(); }
+        return;
+    }
     if (!knobArea.contains(e.position)) return;
     proc.amountParam->beginChangeGesture();
     setAmount(0.0f);
@@ -613,7 +812,7 @@ void Editor::mouseDoubleClick(const juce::MouseEvent& e) {
 }
 
 void Editor::mouseWheelMove(const juce::MouseEvent& e, const juce::MouseWheelDetails& w) {
-    if (!knobArea.contains(e.position)) return;
+    if (creating || !knobArea.contains(e.position)) return;
     const float now = proc.amountParam->convertTo0to1(proc.amountParam->get());
     proc.amountParam->beginChangeGesture();
     setAmount(now + w.deltaY * 0.12f);

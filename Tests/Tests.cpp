@@ -103,8 +103,61 @@ void testPresets() {
     }
     // FECHA E SOBE: low pass closed in the middle, high pass up at the end
     const auto l50 = levelsFor(presets()[1], 0.5f), l100 = levelsFor(presets()[1], 1.0f);
+    for (int p = 0; p < numPresets; ++p) {
+        const auto top = levelsFor(presets()[(size_t) p], 1.0f);
+        expect(top.reverb > 0.5f || top.delay > 0.5f, Processor::presetName(p) + " is a riser (reverb/delay at the top)");
+    }
     expect(l50.lowpassHz < 600.0f, "FECHA E SOBE low pass closes (" + juce::String(l50.lowpassHz) + " Hz)");
     expect(l100.lowpassHz > 15000.0f && l100.highpassHz > 1500.0f, "FECHA E SOBE ends with high pass up");
+    // the drop: after riding the knob up, going back to 0 must give the dry sound right away (no reverb tail)
+    for (int p = 0; p < numPresets; ++p) {
+        Engine e; e.prepare(sr, block);
+        auto b = testSignal(3.0, 0.7f);
+        const auto ref = b;
+        HostTime time; time.hasPpq = true;
+        const int dropAt = (int) (2.0 * sr);
+        for (int start = 0; start < b.getNumSamples(); start += block) {
+            const int n = juce::jmin(block, b.getNumSamples() - start);
+            juce::AudioBuffer<float> view(b.getArrayOfWritePointers(), 2, start, n);
+            time.ppq = (double) start / sr * 2.0;
+            e.process(view, start < dropAt ? (float) start / (float) dropAt : 0.0f, p, time);
+        }
+        // compare 50 ms after the drop with the input (latency-aligned)
+        const int lat = e.latencySamples();
+        double num = 0.0, da = 0.0, db2 = 0.0;
+        for (int i = dropAt + (int) (0.05 * sr); i < b.getNumSamples(); ++i) {
+            const double x = ref.getSample(0, i - lat), y = b.getSample(0, i);
+            num += x * y; da += x * x; db2 += y * y;
+        }
+        const double corr = num / std::sqrt(da * db2 + 1e-12);
+        const double lvl = juce::Decibels::gainToDecibels(std::sqrt(db2 / da));
+        expect(corr > 0.98 && std::abs(lvl) < 1.5, Processor::presetName(p) + " drop is dry and clean (corr " + juce::String(corr, 3)
+                                                        + ", " + juce::String(lvl, 2) + " dB)");
+    }
+    // MEU PRESET: every factory preset survives the trip to CRIAR, and a custom preset processes cleanly
+    for (int p = 0; p < numPresets; ++p) {
+        const auto c = fromPreset(presets()[(size_t) p]);
+        const auto back = toPreset(c);
+        expect(std::abs(levelsFor(back, 1.0f).reverb - levelsFor(presets()[(size_t) p], 1.0f).reverb) < 0.01f,
+               Processor::presetName(p) + " reverb kept in CRIAR");
+    }
+    {
+        Custom c; c.highpass = 1.0f; c.lowpass = 0.8f; c.lowpassType = 1; c.reverb = 1.0f; c.reverbType = 2; c.delay = 0.7f;
+        c.delayDiv = 2; c.stereo = 1.0f; c.stereoType = 1; c.noise = 1.0f; c.gate = 0.5f; c.drive = 0.6f; c.highpassType = 1;
+        const auto pr = toPreset(c);
+        Engine e; e.prepare(sr, block);
+        auto b = testSignal(3.0, 0.8f);
+        HostTime time; time.hasPpq = true;
+        bool finite = true; float peak = 0.0f;
+        for (int start = 0; start < b.getNumSamples(); start += block) {
+            const int n = juce::jmin(block, b.getNumSamples() - start);
+            juce::AudioBuffer<float> view(b.getArrayOfWritePointers(), 2, start, n);
+            time.ppq = (double) start / sr * 2.0;
+            e.process(view, 1.0f, pr, customSlot, time);
+        }
+        for (int ch = 0; ch < 2; ++ch) for (int i = 0; i < b.getNumSamples(); ++i) { finite = finite && std::isfinite(b.getSample(ch, i)); peak = juce::jmax(peak, std::abs(b.getSample(ch, i))); }
+        expect(finite && peak <= 1.0f, "MEU PRESET with everything at max is clean (peak " + juce::String(peak) + ")");
+    }
     // silence in, silence out
     {
         Engine e; e.prepare(sr, block);
@@ -120,7 +173,7 @@ void writeSnapshots(const juce::File& dir) {
     proc.prepareToPlay(sr, block);
     Editor ed(proc);
     const struct { float v; int preset; const char* file; } shots[] {
-        { 0.08f, 0, "1-fogo-baixo.png" }, { 0.42f, 1, "2-esquentando.png" }, { 0.72f, 4, "3-apitando.png" }, { 1.0f, 9, "4-vai-estourar.png" },
+        { 0.08f, 0, "1-comeco.png" }, { 0.42f, 1, "2-subindo.png" }, { 0.72f, 4, "3-quase.png" }, { 1.0f, 2, "4-topo.png" },
     };
     for (auto& s : shots) {
         proc.presetParam->setValueNotifyingHost(proc.presetParam->convertTo0to1((float) s.preset));
@@ -129,6 +182,23 @@ void writeSnapshots(const juce::File& dir) {
         auto f = dir.getChildFile(s.file);
         f.deleteFile();
         if (auto out = f.createOutputStream()) png.writeImageToStream(img, *out);
+    }
+    proc.presetParam->setValueNotifyingHost(proc.presetParam->convertTo0to1(5.0f));
+    ed.setCreating(true);
+    {
+        auto cimg = ed.renderFrame(0.5f, 2.0);
+        auto cf = dir.getChildFile("6-criar.png");
+        cf.deleteFile();
+        juce::PNGImageFormat cpng;
+        if (auto out = cf.createOutputStream()) cpng.writeImageToStream(cimg, *out);
+    }
+    ed.setCreating(false);
+    auto drop = ed.renderFrame(0.0f, 3.0, false, 0.35);
+    {
+        auto df = dir.getChildFile("7-drop.png");
+        df.deleteFile();
+        juce::PNGImageFormat dpng;
+        if (auto out = df.createOutputStream()) dpng.writeImageToStream(drop, *out);
     }
     proc.presetParam->setValueNotifyingHost(proc.presetParam->convertTo0to1(1.0f));
     auto img = ed.renderFrame(0.3f, 2.0, true);
@@ -144,8 +214,8 @@ void writeSnapshots(const juce::File& dir) {
         for (int i = 0; i < 300; ++i) {
             const double t = i / 30.0;
             float v = 0.0f;
-            if (t < 1.0) v = 0.03f; else if (t < 7.0) v = 0.03f + 0.97f * (float) std::pow((t - 1.0) / 6.0, 1.6); else if (t < 9.0) v = 1.0f; else v = 0.0f;
-            auto fr = ed.renderFrame(v, t);
+            if (t < 1.0) v = 0.03f; else if (t < 7.0) v = 0.03f + 0.97f * (float) std::pow((t - 1.0) / 6.0, 1.6); else if (t < 8.5) v = 1.0f; else v = 0.0f;
+            auto fr = ed.renderFrame(v, t, false, t >= 8.5 ? t - 8.5 : -1.0);
             auto ff = fd.getChildFile("f" + juce::String(i).paddedLeft('0', 4) + ".png");
             ff.deleteFile();
             if (auto out = ff.createOutputStream()) png.writeImageToStream(fr, *out);
